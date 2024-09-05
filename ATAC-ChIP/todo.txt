@@ -1,1 +1,6 @@
 https://github.com/Hattyoriiiiiii/ngs-scripts/tree/main 脚本整理
+https://github.com/imbforge/NGSpipe2go ATAC、ChIP、RNA
+https://github.com/RadUtama/CodeSpringLab ATAC、ChIP、RNA
+https://github.com/RadUtama/CodeSpringLab ATAC、ChIP、RNA
+https://github.com/crazyhottommy/RNA-seq-analysis RNA指南
+https://github.com/mdozmorov/RNA-seq RNA
