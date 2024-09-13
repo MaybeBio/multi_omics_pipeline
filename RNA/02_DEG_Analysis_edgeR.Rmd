@@ -1,0 +1,399 @@
+---
+title: "02_DEG_Analysis_edgeR"
+author: "zhuhaitao"
+date: "2024-03-15"
+output: html_document
+---
+Count_allgenes_HMECvsTNBC.tsv
+TPM_allgenes_HMECvsTNBC.tsv
+依据指示，这两个文件是01脚本中所谓应该输入此处部分
+差异表达基因最好TNBC(3个细胞系同时）vs HMEC 直接一次比，不要1 vs 1取交集什么,所以这里建议还是直接使用3vs1的比对模式，然后分组上直接分组为HEMC vs TNBC
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+# Set up the environment 同样脚本的环境设置
+library(knitr)
+opts_chunk$set(cache.path='cache/', fig.path='img/', cache=F, tidy=T, fig.keep='high', echo=F, dpi=100, warnings=F, message=F, comment=NA, warning=F, results='as.is', fig.width = 10, fig.height = 6) #out.width=700, 
+library(pander)
+panderOptions('table.split.table', Inf)
+set.seed(1)
+library(dplyr)
+options(stringsAsFactors = FALSE)
+```
+
+# Libraries
+
+```{r libraries}
+library(dplyr)
+library(readr)
+library(writexl)
+library(edgeR)
+library(annotables) 
+library(clusterProfiler)
+library(enrichplot)
+library(ggplot2)
+organism = "org.Hs.eg.db"
+library(organism, character.only = TRUE)
+```
+
+# Settings
+
+```{r, echo=FALSE}
+# 准备基因注释信息，主要是上面这个R包中的
+#移除基因符号中包含下划线（"_"）或"GL"的行，并移除基因符号中包含NA值的行。最后，移除重复的行，确保每个基因只有一行基因注释信息
+gene_annotations <- grch37[!(grepl("_", grch37$chr) | grepl("GL", grch37$chr)), c("ensgene","symbol", "description", "biotype")]  
+#这里有一个不知道要不要加entrez，查看官方github中的标注即可
+gene_annotations <- gene_annotations[!is.na(gene_annotations$symbol), ]
+gene_annotations <- gene_annotations[!duplicated(gene_annotations), ]
+
+# 工作目录，与01脚本保持一致，即放sf文件的，实际上是存放tsv文件的
+dir_data       <- "/mnt/disk4/haitao/bysj_seu/geo_data/hic/script8/RNA/ens_fa_gtf" 
+#下面文件中输入的是1中未处理过的tsv全部gene，不是后期log2/去除0的其他tsv文件，TPM以及count的数据都处理了
+fileNameIn1    <- file.path(dir_data, "Count_allgenes_HMECvsTNBC.tsv")
+fileNameIn2    <- file.path(dir_data, "TPM_allgenes_HMECvsTNBC.tsv")
+dir_results    <- "/mnt/disk4/haitao/bysj_seu/geo_data/hic/script8/RNA/ens_fa_gtf/DEG"
+fileNameOut1   <- file.path(dir_results, "edgeR_HMEC_vs_TNBC.txt") 
+# 保存所有差异表达分析的结果，可以依据效果修改，这里就直接比对TNBC vs HMEC（不再将所有的rep分开来比较）
+```
+
+# count & TPM preprocess
+```{r}
+# Read the full count table
+counts <- read_tsv(fileNameIn1)
+# Select -specific samples，#这里还是以TNBC vs HMEC全局比对为主，没必要修改为HMEC vs 其他细胞系，所以就没必要修改原始文件了，直接上所有的rep
+#！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！
+# Make annotation data frame
+sample_annotation <- data.frame(Sample = colnames(counts)[grepl("rep", colnames(counts))],
+                                Group  = ifelse(grepl("HMEC", colnames(counts)[grepl("rep", colnames(counts))]), "HMEC", "TNBC"))
+
+#这里的数据框实际上做的是将sample x group的资料，实际上就是采集列名作为sample，然后列名中含有CR的作为CR组，其余编码为PR组
+#实际上的效果就是：
+#sample_annotation
+#Sample Group
+#1 BT549_rep1  TNBC
+#2 BT549_rep2  TNBC
+#3 HCC70_rep1  TNBC
+#4 HCC70_rep2  TNBC
+#5  HMEC_rep1  HMEC
+#6  HMEC_rep2  HMEC
+#7 MB231_rep1  TNBC
+#8 MB231_rep2  TNBC
+#9 MB231_rep3  TNBC
+#如果样本量比较少，暂时是可以手动构建：例如
+#Sample Group
+#1   HMEC  HMEC
+#2  BT549 BT549
+
+
+# Read the TPM counts
+TPM <- read_tsv(fileNameIn2)
+# Select -specific samples，对应前面没必要选取某一细胞系vs HMEC，直接TNBC全部比对
+TPM <- TPM %>% dplyr::select(-starts_with("symbol"))
+# Add average per condition就是HMEC vs TNBC的rep之间的行均值
+TPM <- TPM %>% dplyr::mutate(log2Average.HMEC = rowMeans(TPM %>% dplyr::select(starts_with("HMEC"))), .before = starts_with("BT549")) %>%
+  dplyr::mutate(log2Average.TNBC = rowMeans(TPM %>% dplyr::select(-starts_with("HMEC"))%>%dplyr::select(-starts_with(c("gene_id","symbol")))), .before = starts_with("BT549"))
+#上面的效果就是对HMEC的2个rep取了行均值，然后又对TNBC的几个rep取了行均值
+#或者是使用TPM %>% dplyr::select(-starts_with("HMEC"))%>%dplyr::select(-starts_with(c("gene_id","symbol")))
+#或者是使用grepl之类抓取含有rep的字段，TPM %>% dplyr::select(-starts_with("HMEC"))[, grepl("rep", names(.))]之类
+#也可以直接手动穷举使用多个start_with
+#此处是处理获取对应sample的行均值，然后新添加了2列，最后都将新列放到了原来数据的前面，因为我这里数据构造是先BT549，所以将每一行都加到了BT549S前面
+#效果就是gene_id  symbol log2Average.HMEC log2Average.TNBC BT549_rep1 BT549_rep2 HCC70_rep1 HCC70_rep2 HMEC_rep1 HMEC_rep2 MB231_rep1 MB231_rep2 MB231_rep3
+#在 TPM 数据框中添加了两列，分别是 log2Average.HMEC 和 log2Average.TNBC，这两列分别是以 "HMEC" 和 "TNBC" 开头的列的平均值，并且这两列分别添加到了以 "BT549" 开头的列之前(也就是各个rep最前面)
+
+
+# Convert to log2
+TPM <- cbind(TPM %>% dplyr::select("gene_id"), log2((TPM %>% dplyr::select(-c("gene_id"))) + 1))
+#注意处理上并没有将counts进行log之后转换，但是对TPM进行了
+#将 TPM 数据框中的 gene_id 列与其他列进行拼接，并对其他列中的数据进行 log2 转换，从效果上来讲前2列是理论上log之后mean的符合列名，后几列rep是理论上的log2化
+#效果上就是gene_id 真log+mean 其他是log2
+```
+
+# Analysis 1: gene list ,pre-DEG list
+```{r}
+# "TNBC" vs. "HMEC" comparison, so positive logFC correspond to genes UP in "TNBC"，对应TNBC VS HMEC
+# Define reference and treatment groups
+group_ref <- "HMEC"
+group_trt <- "TNBC"
+# Define analysis ID，analysis_ID 就会是 "TNBC_vs_HMEC
+analysis_ID <- paste0(group_trt, "_vs_", group_ref)  
+# Subset the data, adjust manually，index 是根据每个条目在 sample_annotation$Group 是否匹配 group_trt 或 group_ref 创建一个逻辑向量。这个向量可以用于后续的数据子集操作
+index <- sample_annotation$Group == group_trt | sample_annotation$Group == group_ref    
+#是9个true值,分别对应9个rep
+
+
+#根据特定条件对样本注释和计数数据进行子集操作，并检查处理后的数据是否符合预期
+sample_annotation_subset <- sample_annotation[index, ]
+#这里应该是能够直接定义比对的实际对象的，和前面直接提取出两个对象一致，总之可以改前面的count，也可以改这里的index，都能提取出要比对的对象！！！！！！！！
+counts_subset <- counts[, 3:ncol(counts)]  #就是取出counts除了geneid以及symbol之后的其他部分，实际上就是各个exp对象的count
+counts_subset <- data.frame(Geneid = counts$gene_id, counts_subset[, index])#这里应该值的就是对应的index的作用了，效果其实是一样的
+all.equal(sample_annotation_subset$Sample, colnames(counts_subset[, 2:ncol(counts_subset)]))
+
+# Adjust manually
+Group <- factor(sample_annotation_subset$Group) #将子集化后的样本注释数据中的分组信息提取为因子变量，并存储在 Group 中
+Group <- relevel(Group, ref = group_ref) #将分组因子变量 Group 的参考水平（reference level）调整为 group_ref，这样在后续的统计模型中，就会以 group_ref 作为参考组进行比较
+Group
+design <- model.matrix(~Group, data = Group) #使用因子变量 Group 创建一个设计矩阵 design，该设计矩阵可用于线性模型分析（例如线性回归、方差分析等），其中将考虑不同分组对响应变量的影响
+#主要是为了在统计分析中正确地考虑不同分组对结果的影响，并为模型分析准备好正确的数据结构
+
+
+#https://mp.weixin.qq.com/s/G7LQHvybW32Kn-jPYR7k6A
+#注意到源代码中使用的是glmFit+glmLRT，据称这个是针对sc以及无rep的数据，如果是rep的bulk需要使用其他方法
+#所以对照上面的教程，在keep条件修改了一下，以及其他不同的地方也都修改了一下
+#！！！！！！！！！！！！！！！！！！！！
+
+# Create edgeR object 创建一个 edgeR 对象 edgeR.dgelist，使用提取的基因计数数据和分组信息，并指定基因标识列。这个对象是进行差异表达分析的基础
+edgeR.dgelist = DGEList(counts = counts_subset[, 2:ncol(counts_subset)], genes = counts_subset$Geneid, group = Group)
+# Filtering 根据基因的计数数据进行过滤
+keep <- filterByExpr(edgeR.dgelist) #自动筛选过滤低表达基因,自己修改的，下面的是源代码的
+#keep <- rowSums(cpm(edgeR.dgelist)>1) >= 2 保留在至少2个样本中表达值大于1的基因。这样的过滤可以帮助减少不具有表达变化的基因，提高分析的可靠性
+edgeR.dgelist <- edgeR.dgelist[keep, , keep.lib.sizes=FALSE] #根据过滤条件将 edgeR.dgelist 对象中的基因进行筛选，保留符合要求的基因
+# Normalization 对筛选后的数据进行标准化，采用 TMM（trimmed mean of M values）方法来计算规范化因子，使得不同样本之间的基因表达数据可比较
+edgeR.dgelist = calcNormFactors((edgeR.dgelist), method = "TMM")
+edgeR.dgelist = estimateDisp(edgeR.dgelist, design, robust=T) #估计数据的离散度，根据设计矩阵 design 计算每个基因的离散度参数，用于后续的差异表达分析
+
+
+#通过拟合模型和进行组间比较，可以识别基因在不同组间表达水平上的显著差异
+#同样进行修改，如果是无rep或者是sc的，是使用glmFit+glmLRT，也就是To perform likelihood ratio test：scRNA-seq and no replicates data
+#To perform quasi-likelihood(QL) F-test tests:  bulk RNA-seq ,则使用glmQLFit+glmQLFTest
+# One-way ANOVA analysis 
+fit <- glmQLFit(edgeR.dgelist, design, robust=T)
+# Individual comparisons 
+lrt <- glmQLFTest(fit, coef = 2)
+#在这里，coef = 2 表示对比的组，可能是指 group_trt 对应的组（比如 "TNBC"）与参考组 group_ref（比如 "HMEC"）之间的比较
+
+res.full <- topTags(object = lrt, n = Inf)
+res.full <- na.omit(res.full)
+res.full_to_save <- left_join(res.full$table, gene_annotations, by = c("genes" = "ensgene"))
+# Append TPMs
+res.full_to_save <- left_join(res.full_to_save, TPM, by = c("genes" = "gene_id"))
+# Save the data
+write_tsv(res.full_to_save, fileNameOut1)
+write_csv(res.full_to_save,file.path(dir_results, "edgeR_HMEC_vs_TNBC.csv"))
+#这里的数据实际上就是edgeR_HMEC_vs_TNBC.txt,最好是保存成csv文件
+#dim(res.full_to_save ) #17518
+
+```
+
+# Analysis 2: DEG list,UP AND DOWN
+DEG_TNBC是所有的DEG文件，按照FDR 0.05 以及logFC 1的标准识别的DEG
+TNBC_up_DEGs，TNBC_dn_DEGs：分别从上面中提取的上下调的DEG数据款
+DEG：在分析3中的，是含有原始gene的list
+
+```{r}
+#然后这个文件是可以直接进行DEG分析的
+DEG_TNBC <-subset(res.full_to_save, FDR < 0.05 & (logFC > 1 | logFC < -1))
+write_tsv(DEG_TNBC, file = "edgeR_HMEC_vs_TNBC_FDR0.05_logFC1_DEG.txt") 
+write_csv(DEG_TNBC,file.path(dir_results,"edgeR_HMEC_vs_TNBC_FDR0.05_logFC1_DEG.csv"))
+#生成的上调基因结果文件,1265个DEG，差不多1k左右
+#dim(DEG_TNBC) 1265
+
+#如果觉得gene过少或者是过少，都可以直接修改FDR以及logFC方面的阈值
+#sign_genes1 <-subset(res.full_to_save, FDR < 0.01 & (logFC > 1 | logFC < -1))
+#write_tsv(sign_genes1 , file = "edgeR_HMEC_vs_BT549_FDR0.01_logFC1_DEG.txt")    
+
+#sign_genes2 <-subset(res.full_to_save, FDR < 0.005 & (logFC > 1 | logFC < -1))
+#write_tsv(sign_genes2 , file = "edgeR_HMEC_vs_BT549_FDR0.005_logFC1_DEG.txt")  
+
+#sign_genes3 <-subset(res.full_to_save, FDR < 0.005 & (logFC > 2 | logFC < -2))
+#write_tsv(sign_genes3 , file = "edgeR_HMEC_vs_BT549_FDR0.005_logFC2_DEG.txt")  
+
+
+#TNBC中上下调
+TNBC_up_DEGs <- subset(DEG_TNBC, logFC > 1) #477 
+write_tsv(TNBC_up_DEGs, file = "edgeR_HMEC_vs_TNBC_FDR0.05_logFC1_up_DEG.txt")
+write_csv(TNBC_up_DEGs,file.path(dir_results,"edgeR_HMEC_vs_TNBC_FDR0.05_logFC1_up_DEG.csv"))
+
+TNBC_dn_DEGs <- subset(DEG_TNBC, logFC < -1) #788
+write_tsv(TNBC_dn_DEGs , file = "edgeR_HMEC_vs_TNBC_FDR0.05_logFC1_down_DEG.txt")
+write_csv(TNBC_dn_DEGs,file.path(dir_results,"edgeR_HMEC_vs_TNBC_FDR0.05_logFC1_down_DEG.csv"))
+```
+
+
+
+下面的数据分析主要是为了承接02脚本本身的DEG输出到区室AB分析中所需要的DEG注释数据
+理论上承接的是DEG分析中03脚本GSEA的操作，但是为了节省操作，还是直接在02脚本本身就有输出的情况下修改
+主要是设法沟通自己构建的02脚本的输出DEG到原本03脚本的输出fileNameOut2 上
+即自己构建的DEG list文件edgeR_HMEC_vs_TNBC_FDR0.05_logFC1_DEG.csv   到原本输出的DEG/DEGs_edgeR_HMEC_BT549_annotated.xlsx上
+实际上原本的输出文件DEG/DEGs_edgeR_HMEC_BT549_annotated.xlsx上是多sheet的统计summary表格，只有第三列才是DEG，但是区室分析中只有DEG用得到，所以就不执行全部的原始输出文件分析了，就将DEG转换成原始输出对应的格式即可，其他sheet中的输出文件此此分析略，因为用不上
+```{r}
+#因重开项目会清空环境，所以还是直接读取本身02脚本的DEG输出文件，即edgeR_HMEC_vs_TNBC_FDR0.05_logFC1_DEG.csv
+data_dir <- "/mnt/disk4/haitao/bysj_seu/geo_data/hic/script8/RNA/ens_fa_gtf"
+fileNameIn1 <- file.path(data_dir, "DEG/edgeR_HMEC_vs_TNBC_FDR0.05_logFC1_DEG.txt") #无论是edgeR_HMEC_vs_TNBC_FDR0.05_logFC1_DEG.txt还是edgeR_HMEC_vs_TNBC_FDR0.05_logFC1_DEG.csv都是一样的数据，都可以读入
+fileNameOut2 <- file.path(data_dir, "DEG/edgeR_HMEC_vs_TNBC_FDR0.05_logFC1_DEG_annotated.xlsx")
+#注意此处，原本对应的是03分析脚本以及dchic区室gene脚本中对应的DEGs_edgeR_HMEC_BT549_annotated.xlsx文件
+
+#load data
+mtx <- read_tsv(fileNameIn1)
+mtx$ensgenes <- mtx$genes
+mtx$genes <- mtx$symbol
+mtx <- mtx[, c("ensgenes", "genes", "logFC", "logCPM", "F", "PValue", "FDR", "symbol", "biotype", "description")] #理论上只需要这几列
+write_xlsx(mtx, fileNameOut2)
+
+
+#这里将原始的DEG处理前的gene也做一个处理
+mtx <- read_tsv("/mnt/disk4/haitao/bysj_seu/geo_data/hic/script8/RNA/ens_fa_gtf/DEG/edgeR_HMEC_vs_TNBC.txt")
+mtx$ensgenes <- mtx$genes
+mtx$genes <- mtx$symbol
+mtx <- mtx[, c("ensgenes", "genes", "logFC", "logCPM", "F", "PValue", "FDR", "symbol", "biotype", "description")] #理论上只需要这几列
+write_xlsx(mtx,"/mnt/disk4/haitao/bysj_seu/geo_data/hic/script8/RNA/ens_fa_gtf/DEG/edgeR_HMEC_vs_TNBC_FDR0.05_logFC1_all_annotated.xlsx")
+```
+
+
+# Analysis 3: DEG经典分析，火山图
+可以参考04a以及04b的Rmd文件，修改完善一下火山图，比如说是top的gene显示，DEG数目的展示等
+DEG_TNBC是所有的DEG文件，按照FDR 0.05 以及logFC 1的标准识别的DEG
+TNBC_up_DEGs，TNBC_dn_DEGs：分别从上面中提取的上下调的DEG数据款
+DEG：在分析3中的，是含有原始gene的list
+```{r}
+#到时候可以对照04a以及04b的Rmd文件，看看有没有参考必要，下游分析的数据文件基准是res.full
+DEG<-as.data.frame(res.full)
+DEG$logFC<-as.numeric(DEG$logFC)
+DEG$type[DEG$FDR < 0.05 & DEG$logFC > 1] = "UP"
+DEG$type[DEG$FDR < 0.05 & DEG$logFC < -1] = "DOWN"
+DEG$type[DEG$FDR < 0.05 & abs(DEG$logFC) <= 1] = "NOT"
+DEG$type[DEG$FDR >= 0.05] = "NOT"
+library(ggplot2)
+library(ggthemes)
+ggplot(DEG,aes(x=logFC,y=-1*log10(FDR),colour=type))+
+  xlab("log2(Fold Change)")+
+  ylab("-log10(FDR)")+
+  geom_point(size=2,alpha=0.6)+                  # 设定点的大小
+  scale_color_manual(values =c("blue","grey","red"))+       #设定上下调颜色 
+  geom_hline(yintercept=1.30103,linetype=3)+                # 增加水平间隔线
+  geom_vline(xintercept=c(-1,1),linetype=3)+                #增加垂直间隔线
+  theme_few()+                                              # 去掉网格背景
+  theme(legend.title = element_blank())+ggtitle('HMEC vs TNBC volcano')                     # 去掉图注标签
+ggsave("HMEC_vs_TNBC_FDR0.05_logFC1_DEG_volcano.pdf",height = 7,width = 7)
+
+```
+
+
+# Analysis 4: DEG经典分析，热图，暂时没有成功，可以不绘制
+```{r}
+```
+
+
+# Analysis 5: DEG经典分析，GSEA
+是DEG的经典下游承接，实际上是直接获得DEG或者是gene list之后就可以做，不需要和上面的承接
+
+DEG_TNBC是所有的DEG文件，按照FDR 0.05 以及logFC 1的标准识别的DEG
+TNBC_up_DEGs，TNBC_dn_DEGs：分别从上面中提取的上下调的DEG数据款
+DEG：在分析3中的，是含有原始gene的list
+
+
+主要是使用GO以及KEGG的注释：
+GO分析中需要注意的是
+此处需要注意的参数就只有ont，也就是GO本体论中的3个层次， "MF", "BP", and "CC"
+MF（分子功能）：指基因产物（如蛋白质）执行的特定分子活动或催化功能
+CC（细胞组分）：描述基因产物在细胞内活动或定位的特定细胞位置或细胞器
+BP（生物过程）：代表由多个基因产物共同作用形成的较大生物途径或过程
+另外一个参数是level，值的是levels in gene ontology，无定论，层级越高描述就越术语化以及越有限
+
+
+初始的注释分析都是基于GO以及KEGG
+然后有了注释对象之后就是画图
+各种绘图主要是：
+https://yulab-smu.top/biomedical-knowledge-mining-book/enrichplot.html（主要看里面的GO+KEGG方面）
+https://learn.gencore.bio.nyu.edu/rna-seq-analysis/gene-set-enrichment-analysis/
+
+通路可以参考https://learn.gencore.bio.nyu.edu/rna-seq-analysis/gene-set-enrichment-analysis/
+可以试一下gseaplot2这里对应的多gene集中BA和UP是否是对应的
+```{r}
+#首先使用含有所有差异表达gene的数据框DEG_TNBC
+#参照https://yulab-smu.top/biomedical-knowledge-mining-book/faq.html#genelist，准备对应的gene list，以下三步就是准备DEG_TNBC的genelist，其他up以及down的同理模仿构造
+#准备logFC向量
+geneList_DEG = DEG_TNBC[,2]
+#准备name即gene id向量，也可以使用第7列即symbol列，后续分析会用到symbol
+names(geneList_DEG) = as.character(DEG_TNBC[,1])
+#准备排序向量，即依据logFC降序
+geneList_DEG = sort(geneList_DEG, decreasing = TRUE)
+
+
+#下面是核心，可以试一下up和down有无必要分开来试试，以及ont是否有必要每一个ont层次都拿出来试试！！！！！！！！！
+gse_DEG <- gseGO(geneList=geneList_DEG, 
+             ont ="ALL", 
+             keyType = "ENSEMBL", 
+             minGSSize = 10, 
+             maxGSSize = 800, 
+             pvalueCutoff = 0.05, 
+             verbose = TRUE, 
+             OrgDb = organism)
+
+#Visualize enriched GO terms 
+options(enrichplot.colours = c("red","blue"))#这段代码是为了使颜色恢复成经典红蓝色https://github.com/YuLab-SMU/enrichplot/issues/268
+
+#barplot!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!失效,开发者没有维护barplot功能，只能使用通用的barplot，需要自己动手,暂时不做了
+barplot(as.numeric(gse_DEG$Description),showCategory=20)
+barplot(gse_DEG_symbol)
+goplot(gse_DEG)
+
+#dotplot
+dotplot(gse_DEG, showCategory=20)   #+ ggtitle("Dotplot for DEG GSEA across HMEC vs TNBC")  #只画了top20
+ggsave("DEG_all_GSEA_HMEC_vs_TNBC_dotplot.pdf",height = 7,width = 7)
+dotplot(gse_DEG, showCategory=10, split=".sign") + facet_grid(.~.sign)   #+ ggtitle("dotplot for DEG GSEA across HMEC vs TNBC") 
+ggsave("DEG_all_GSEA_HMEC_vs_TNBC_dotplot_sign.pdf",height = 7,width = 7) #包含有activated，suppressed
+
+#ridgeline plot 脊线图
+ridgeplot(gse_DEG,showCategory = 20)+ labs(x = "enrichment distribution")  #+ggtitle("Ridgeplot for DEG GSEA across HMEC vs TNBC")
+ggsave("DEG_all_GSEA_HMEC_vs_TNBC_ridgeplot.pdf",height = 9,width = 12)
+
+
+#cnetplot()将基因和生物学概念(例如GO术语或KEGG通路)的联系描述为一个网络
+## convert gene ID to Symbol，可以使用 bitr函数，也是clusterprofiler这个包里的,因为原始数据中有symbol，所以还是直接使用，不转换了
+#因为原始图是使用ensmbl标注的，比较丑，所以才转换
+geneList_DEG_symbol = DEG_TNBC[,2]
+names(geneList_DEG_symbol) = as.character(DEG_TNBC[,7])
+geneList_DEG_symbol = sort(geneList_DEG_symbol, decreasing = TRUE)
+gse_DEG_symbol <- gseGO(geneList=geneList_DEG_symbol, 
+             ont ="ALL", 
+             keyType = 'SYMBOL', 
+             minGSSize = 10, 
+             maxGSSize = 800, 
+             pvalueCutoff = 0.05, 
+             verbose = TRUE, 
+             OrgDb = organism)
+cnetplot(gse_DEG, foldChange=geneList_DEG)
+cnetplot(gse_DEG_symbol, foldChange=geneList_DEG_symbol)
+ggsave("DEG_all_GSEA_HMEC_vs_TNBC_heatplot_cnetplot.pdf",height = 7,width = 7)
+cnetplot(gse_DEG_symbol, foldChange=geneList_DEG_symbol, circular = TRUE, colorEdge = TRUE)
+ggsave("DEG_all_GSEA_HMEC_vs_TNBC_heatplot_cnetplot_circ.pdf",height = 7,width = 10)
+
+
+# Heatmap-like functional classification，与cnetplot类似,也使用symbol的效果看看
+heatplot(gse_DEG,foldChange=geneList_DEG,showCategory = 5)
+ggsave("DEG_all_GSEA_HMEC_vs_TNBC_heatplot_ens.pdf",height = 3,width = 15)
+heatplot(gse_DEG_symbol,foldChange=geneList_DEG_symbol,showCategory = 5)
+ggsave("DEG_all_GSEA_HMEC_vs_TNBC_heatplot_symbol.pdf",height = 3,width = 15)
+heatplot(gse_DEG_symbol,foldChange=geneList_DEG_symbol,showCategory = 10)
+ggsave("DEG_all_GSEA_HMEC_vs_TNBC_heatplot_symbol_10.pdf",height = 4,width = 16)
+
+#Tree plot富集项的分层聚类
+gse_DEG2 <- pairwise_termsim(gse_DEG)
+treeplot(gse_DEG2)
+ggsave("DEG_all_GSEA_HMEC_vs_TNBC_treeplot.pdf",height = 7,width = 12)
+
+#Enrichment Map富集的术语组织成一个网络，网络的边缘连接重叠的基因集。这样，相互重叠的基因集往往会聚集在一起，便于识别功能模块
+gse_DEG2 <- pairwise_termsim(gse_DEG)
+emapplot(gse_DEG2,layout="kk",showCategory = 20) #可以修改layout='circle'之类
+ggsave("DEG_all_GSEA_HMEC_vs_TNBC_EnrichmentMap.pdf",height = 7,width = 7)
+
+#running score and preranked list of GSEA result，对于GSEA的传统可视化方法
+p1 <- gseaplot(gse_DEG, geneSetID = 1, by = "runningScore", title = gse_DEG$Description[1])
+p2 <- gseaplot(gse_DEG, geneSetID = 1, by = "preranked", title = gse_DEG$Description[1])
+p3 <- gseaplot(gse_DEG, geneSetID = 1, title = gse_DEG$Description[1])
+#cowplot::plot_grid(p1, p2, p3, ncol=1, labels=LETTERS[1:3])
+ggsave("DEG_all_GSEA_HMEC_vs_TNBC_gseaplot.pdf",p3,height = 7,width = 7)
+gseaplot2(gse_DEG, geneSetID = 1:5)
+ggsave("DEG_all_GSEA_HMEC_vs_TNBC_gseaplot_5.pdf",height = 7,width = 10)
+
+
+
+#KEGG分析方面有报错，暂时没有解决
+gse_DEG_kegg <- gseKEGG(geneList=geneList_DEG, 
+             organism = 'hsa', 
+             keyType = "kegg", 
+             minGSSize = 10, 
+             maxGSSize = 800, 
+             pvalueCutoff = 0.05, 
+             verbose = TRUE)
+#Error in check_gene_id(geneList, geneSets) :  --> No gene can be mapped...
+```
+
